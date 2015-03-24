@@ -14,6 +14,8 @@
 
 namespace Kafka;
 
+use Kafka\Exception\SocketEOF;
+
 /**
 +------------------------------------------------------------------------------
 * Kafka protocol since Kafka v0.8
@@ -86,7 +88,7 @@ class Socket
     /**
      * Socket port
      *
-     * @var mixed
+     * @var int
      * @access private
      */
     private $port = -1;
@@ -119,7 +121,7 @@ class Socket
      *
      * @static
      * @access public
-     * @return void
+     * @return Socket
      */
     public static function createFromStream($stream)
     {
@@ -136,11 +138,21 @@ class Socket
      *
      * @param mixed $stream
      * @access public
-     * @return void
+     * @return $this
+     * @throws \InvalidArgumentException
      */
     public function setStream($stream)
     {
+        if (!is_resource($stream)) {
+            throw new \InvalidArgumentException(
+                sprintf(
+                    'Stream should be a resource, %s given',
+                    is_object($stream) ? get_class($stream) : gettype($stream)
+                )
+            );
+        }
         $this->stream = $stream;
+        return $this;
     }
 
     // }}}
@@ -150,37 +162,42 @@ class Socket
      * Connects the socket
      *
      * @access public
-     * @return void
+     * @return $this
      */
     public function connect()
     {
-        if (is_resource($this->stream)) {
-            return false;
+        if (!is_resource($this->stream)) {
+            if (empty($this->host)) {
+                throw new \Kafka\Exception('Cannot open null host.');
+            }
+            if ($this->port <= 0) {
+                throw new \Kafka\Exception('Cannot open without port.');
+            }
+    
+    
+            $this->stream = fsockopen(
+                $this->host,
+                $this->port,
+                $errno,
+                $errstr,
+                $this->sendTimeoutSec + ($this->sendTimeoutUsec / 1000000)
+            );
+    
+            if ($this->stream == false) {
+                throw new \RuntimeException(
+                    sprintf(
+                        'Could not connect to %s:%d -> %s (%d)',
+                        $this->host,
+                        $this->port,
+                        $errstr,
+                        $errno
+                    )
+                );
+            }
+    
+            stream_set_blocking($this->stream, 0);
         }
-
-        if (empty($this->host)) {
-            throw new \Kafka\Exception('Cannot open null host.');
-        }
-        if ($this->port <= 0) {
-            throw new \Kafka\Exception('Cannot open without port.');
-        }
-
-        $this->stream = @fsockopen(
-            $this->host,
-            $this->port,
-            $errno,
-            $errstr,
-            $this->sendTimeoutSec + ($this->sendTimeoutUsec / 1000000)
-        );
-
-        if ($this->stream == false) {
-            $error = 'Could not connect to '
-                    . $this->host . ':' . $this->port
-                    . ' ('.$errstr.' ['.$errno.'])';
-            throw new \Kafka\Exception($error);
-        }
-
-        stream_set_blocking($this->stream, 0);
+        return $this;
     }
 
     // }}}
@@ -190,13 +207,14 @@ class Socket
      * close the socket
      *
      * @access public
-     * @return void
+     * @return $this
      */
     public function close()
     {
         if (is_resource($this->stream)) {
             fclose($this->stream);
         }
+        return $this;
     }
 
     // }}}
@@ -217,55 +235,92 @@ class Socket
     public function read($len, $verifyExactLength = false)
     {
         if ($len > self::READ_MAX_LEN) {
-            throw new \Kafka\Exception\SocketEOF('Could not read '.$len.' bytes from stream, length too longer.');
+            throw new \InvalidArgumentException(
+                sprintf(
+                    'Unable to read %d bytes from stream, max length is %d',
+                    $len,
+                    self::READ_MAX_LEN
+                )
+            );
         }
 
-        $null = null;
+        //use separate variables (to keep refcount at 1)
+        $write = null;
+        //use temp stream for errors that might occur?
+        $ex = null;//array(fopen('php://temp', 'w+'));
+        //if ($ex[0] === false) {
+        //    $ex = null;
+        //}
         $read = array($this->stream);
-        $readable = @stream_select($read, $null, $null, $this->recvTimeoutSec, $this->recvTimeoutUsec);
-        if ($readable > 0) {
-            $remainingBytes = $len;
-            $data = $chunk = '';
-            while ($remainingBytes > 0) {
+        $readable = stream_select(
+            $read,
+            $write,
+            $ex,
+            $this->recvTimeoutSec,
+            $this->recvTimeoutUsec
+        );
+        $remainingBytes = $len;
+        $data = '';
+        while($readable !== false && $remainingBytes) {
+            //if no stream was altered, then do nothing
+            if ($readable) {
                 $chunk = fread($this->stream, $remainingBytes);
                 if ($chunk === false) {
-                    $this->close();
-                    throw new \Kafka\Exception\SocketEOF('Could not read '.$len.' bytes from stream (no data)');
+                    throw new \RuntimeException(
+                        sprintf(
+                            'Error reading %d bytes from stream',
+                            $remainingBytes
+                        )
+                    );
                 }
-                if (strlen($chunk) === 0) {
-                    // Zero bytes because of EOF?
-                    if (feof($this->stream)) {
-                        $this->close();
-                        throw new \Kafka\Exception\SocketEOF('Unexpected EOF while reading '.$len.' bytes from stream (no data)');
+                $bytesRead = strlen($chunk);
+                if ($bytesRead) {
+                    $data .= $chunk;
+                    $remainingBytes -= $bytesRead;
+                } elseif (feof($this->stream)) {
+                    //reached end of stream, but we could've read something
+                    //EOF or max bytes, whichever comes first, this is NOT an exception-case
+                    break;
+                } else {
+                    //streams HAVE changed, no data gotten by fread, and stream is not EOF
+                    //check timeout
+                    $res = stream_get_meta_data($this->stream);
+                    if (!empty($res['timed_out'])) {
+                        throw new \RuntimeException(
+                            sprintf(
+                                'stream timed out reading %d bytes',
+                                $len
+                            )
+                        );
                     }
-                    // Otherwise wait for bytes
-                    $readable = @stream_select($read, $null, $null, $this->recvTimeoutSec, $this->recvTimeoutUsec);
-                    if ($readable !== 1) {
-                        throw new \Kafka\Exception\SocketTimeout('Timed out reading socket while reading ' . $len . ' bytes with ' . $remainingBytes . ' bytes to go');
-                    }
-                    continue; // attempt another read
+                    //nothing was read, but some stream WAS altered, check $ex stream?
+                    throw new \RuntimeException(
+                        'Something was written to write or except streams?'
+                    );
                 }
-                $data .= $chunk;
-                $remainingBytes -= strlen($chunk);
             }
-            if ($len === $remainingBytes || ($verifyExactLength && $len !== strlen($data))) {
-                // couldn't read anything at all OR reached EOF sooner than expected
-                $this->close();
-                throw new \Kafka\Exception\SocketEOF('Read ' . strlen($data) . ' bytes instead of the requested ' . $len . ' bytes');
-            }
-
-            return $data;
+            //check stream again, keep doing so until we've read all bytes
+            //or feof $this->stream is true
+            $readable = stream_select(
+                $read,
+                $write,
+                $ex,
+                $this->recvTimeoutSec,
+                $this->recvTimeoutUsec
+            );
         }
-        if (false !== $readable) {
-            $res = stream_get_meta_data($this->stream);
-            if (!empty($res['timed_out'])) {
-                $this->close();
-                throw new \Kafka\Exception\SocketTimeout('Timed out reading '.$len.' bytes from stream');
-            }
+        if ($remainingBytes && $verifyExactLength) {
+            //we needed exactly $len bytes, but we fell $remainingBytes short
+            throw new SocketEOF(
+                sprintf(
+                    'Needed to read %d bytes, instead read %d bytes (%d short)',
+                    $len,
+                    $len - $remainingBytes,
+                    $remainingBytes
+                )
+            );
         }
-        $this->close();
-        throw new \Kafka\Exception\SocketEOF('Could not read '.$len.' bytes from stream (not readable)');
-
+        return $data;
     }
 
     // }}}
@@ -317,15 +372,22 @@ class Socket
     /**
      * Rewind the stream
      *
-     * @return void
+     * @return $this
      */
     public function rewind()
     {
         if (is_resource($this->stream)) {
             rewind($this->stream);
         }
+        return $this;
     }
-
     // }}}
     // }}}
+    /**
+     * Simple destructor, ensuring the socket is closed when the instance is GC'ed
+     */
+    public function __destruct()
+    {
+        $this->close();
+    }
 }
